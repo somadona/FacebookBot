@@ -27,16 +27,5 @@ chrome.action.onClicked.addListener((tab) => {
   }
 });
 
-// Listen for tab updates to handle navigation
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status === 'complete' && tab.url && tab.url.includes('tiktok.com')) {
-    // Inject content script when TikTok page loads
-    chrome.scripting.executeScript({
-      target: { tabId: tabId },
-      files: ['content.js']
-    }).catch(err => {
-      // Content script might already be injected
-      console.log('Content script injection skipped:', err.message);
-    });
-  }
-});
+// Note: We no longer inject content scripts from here.
+// The content script is declared in manifest.json under content_scripts.

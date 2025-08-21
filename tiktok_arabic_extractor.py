@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TikTok Arabic Video Extractor - Python Version
+TikTok Arabic Video Extractor - Python Version (Fixed)
 A Python script that uses Selenium to extract TikTok videos with Arabic text in captions.
 """
 
@@ -20,6 +20,7 @@ try:
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.chrome.options import Options
     from selenium.common.exceptions import TimeoutException, NoSuchElementException
+    from selenium.webdriver.common.action_chains import ActionChains
 except ImportError:
     print("Error: Selenium is not installed. Please install it first:")
     print("pip install selenium")
@@ -37,6 +38,9 @@ class TikTokArabicExtractor:
         self.scroll_pause = scroll_pause
         self.extracted_videos = []
         self.is_running = False
+        self.last_scroll_position = 0
+        self.scroll_attempts = 0
+        self.max_scroll_attempts = 100
         
         # Arabic text detection regex
         self.arabic_regex = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]')
@@ -87,7 +91,14 @@ class TikTokArabicExtractor:
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
             
+            # Wait a bit more for dynamic content
+            time.sleep(3)
+            
             print("✓ TikTok page loaded successfully")
+            
+            # Detect page type
+            self._detect_page_type()
+            
             return True
             
         except TimeoutException:
@@ -96,6 +107,24 @@ class TikTokArabicExtractor:
         except Exception as e:
             print(f"✗ Error navigating to TikTok: {e}")
             return False
+    
+    def _detect_page_type(self):
+        """Detect what type of TikTok page we're on."""
+        try:
+            # Check for video elements
+            video_elements = self.driver.find_elements(By.TAG_NAME, "video")
+            feed_items = self.driver.find_elements(By.CSS_SELECTOR, '[data-e2e="feed-item"], [data-e2e="browse-feed-item"]')
+            
+            print(f"Found {len(video_elements)} video elements and {len(feed_items)} feed items")
+            
+            if video_elements.length > 0 or feed_items.length > 0:
+                print("✓ Video feed page detected - ready for extraction")
+            else:
+                print("⚠️  Not a video feed page - extraction may not work properly")
+                print("Please navigate to TikTok's For You page or main feed")
+                
+        except Exception as e:
+            print(f"Error detecting page type: {e}")
     
     def start_extraction(self, max_scrolls: int = 50) -> None:
         """
@@ -109,23 +138,31 @@ class TikTokArabicExtractor:
             return
         
         self.is_running = True
+        self.scroll_attempts = 0
         print(f"Starting extraction with max {max_scrolls} scrolls...")
         print("Press Ctrl+C to stop early")
         
         try:
             scroll_count = 0
-            while self.is_running and scroll_count < max_scrolls:
+            while self.is_running and scroll_count < max_scrolls and self.scroll_attempts < self.max_scroll_attempts:
                 # Extract videos from current view
                 self._extract_videos_from_current_view()
                 
-                # Scroll down
-                self._scroll_down()
-                scroll_count += 1
-                
-                print(f"Scroll {scroll_count}/{max_scrolls} - Found {len(self.extracted_videos)} videos with Arabic captions")
-                
-                # Wait before next scroll
-                time.sleep(self.scroll_pause)
+                # Check if we can scroll
+                if self._can_scroll():
+                    # Scroll down
+                    self._scroll_down()
+                    scroll_count += 1
+                    self.scroll_attempts += 1
+                    
+                    print(f"Scroll {scroll_count}/{max_scrolls} - Found {len(self.extracted_videos)} videos with Arabic captions")
+                    
+                    # Wait before next scroll
+                    time.sleep(self.scroll_pause)
+                else:
+                    print("Cannot scroll further, content may be fully loaded")
+                    self.scroll_attempts += 1
+                    time.sleep(2)
                 
         except KeyboardInterrupt:
             print("\nExtraction stopped by user")
@@ -135,39 +172,124 @@ class TikTokArabicExtractor:
             self.is_running = False
             print(f"\nExtraction completed. Total videos found: {len(self.extracted_videos)}")
     
+    def _can_scroll(self) -> bool:
+        """Check if we can scroll further."""
+        try:
+            current_position = self.driver.execute_script("return window.pageYOffset;")
+            document_height = self.driver.execute_script("return document.documentElement.scrollHeight;")
+            window_height = self.driver.execute_script("return window.innerHeight;")
+            
+            # Check if we're near the bottom
+            is_near_bottom = current_position + window_height >= document_height - 100
+            
+            # Check if scroll position changed
+            has_scrolled = current_position > self.last_scroll_position
+            
+            self.last_scroll_position = current_position
+            
+            return not is_near_bottom or has_scrolled
+            
+        except Exception as e:
+            print(f"Error checking scroll position: {e}")
+            return True
+    
+    def _scroll_down(self) -> None:
+        """Scroll down the page to load more content."""
+        try:
+            # Try smooth scrolling first
+            self.driver.execute_script("window.scrollBy({top: 800, behavior: 'smooth'});")
+        except Exception as e:
+            try:
+                # Fallback to direct scrolling
+                self.driver.execute_script("window.scrollBy(0, 800);")
+            except Exception as e2:
+                # Last resort: scroll to specific position
+                current_pos = self.driver.execute_script("return window.pageYOffset;")
+                self.driver.execute_script(f"window.scrollTo(0, {current_pos + 800});")
+    
     def _extract_videos_from_current_view(self) -> None:
         """Extract videos from the currently visible area."""
         try:
-            # Look for video containers using various selectors
-            video_selectors = [
+            # Multiple strategies to find video content
+            video_containers = []
+            
+            # Strategy 1: Look for TikTok's specific data attributes
+            data_e2e_selectors = [
                 '[data-e2e="feed-item"]',
                 '[data-e2e="browse-feed-item"]',
-                'div[class*="DivItemContainer"]',
-                'div[class*="DivVideoFeedV2"]',
-                'div[class*="DivVideoFeed"]'
+                '[data-e2e="video-feed-item"]',
+                '[data-e2e="trending-item"]'
             ]
             
-            video_containers = []
-            for selector in video_selectors:
+            for selector in data_e2e_selectors:
                 try:
                     containers = self.driver.find_elements(By.CSS_SELECTOR, selector)
                     if containers:
                         video_containers = containers
+                        print(f"Found {len(containers)} containers using selector: {selector}")
                         break
                 except:
                     continue
             
-            # Fallback: look for any div that might contain video content
+            # Strategy 2: Look for video elements and their containers
             if not video_containers:
-                all_divs = self.driver.find_elements(By.TAG_NAME, "div")
-                video_containers = [div for div in all_divs if 
-                                  div.find_elements(By.TAG_NAME, "video") or 
-                                  div.find_elements(By.CSS_SELECTOR, 'a[href*="/video/"]')]
+                try:
+                    video_elements = self.driver.find_elements(By.TAG_NAME, "video")
+                    if video_elements:
+                        video_containers = []
+                        for video in video_elements:
+                            # Find the closest container div
+                            try:
+                                container = video.find_element(By.XPATH, "./ancestor::div[contains(@class, 'Div') or contains(@class, 'div') or contains(@class, 'Item') or contains(@class, 'item')][1]")
+                                video_containers.append(container)
+                            except:
+                                video_containers.append(video.find_element(By.XPATH, "./.."))
+                        print(f"Found {len(video_elements)} video elements")
+                except Exception as e:
+                    print(f"Error finding video elements: {e}")
+            
+            # Strategy 3: Look for links that contain video URLs
+            if not video_containers:
+                try:
+                    video_links = self.driver.find_elements(By.CSS_SELECTOR, 'a[href*="/video/"], a[href*="/@"]')
+                    if video_links:
+                        video_containers = []
+                        for link in video_links:
+                            try:
+                                container = link.find_element(By.XPATH, "./ancestor::div[contains(@class, 'Div') or contains(@class, 'div') or contains(@class, 'Item') or contains(@class, 'item')][1]")
+                                video_containers.append(container)
+                            except:
+                                video_containers.append(link.find_element(By.XPATH, "./.."))
+                        print(f"Found {len(video_links)} video links")
+                except Exception as e:
+                    print(f"Error finding video links: {e}")
+            
+            # Strategy 4: Fallback - look for any div that might contain content
+            if not video_containers:
+                try:
+                    all_divs = self.driver.find_elements(By.TAG_NAME, "div")
+                    potential_containers = []
+                    for div in all_divs[:100]:  # Limit to first 100
+                        try:
+                            has_video = div.find_elements(By.TAG_NAME, "video")
+                            has_video_link = div.find_elements(By.CSS_SELECTOR, 'a[href*="/video/"]')
+                            has_substantial_text = div.text and len(div.text) > 20
+                            
+                            if has_video or has_video_link or has_substantial_text:
+                                potential_containers.append(div)
+                        except:
+                            continue
+                    
+                    video_containers = potential_containers[:20]  # Limit to first 20
+                    print(f"Fallback: Found {len(video_containers)} potential containers")
+                except Exception as e:
+                    print(f"Error in fallback strategy: {e}")
             
             # Process each container
-            for container in video_containers:
-                self._process_video_container(container)
-                
+            for i, container in enumerate(video_containers):
+                if i < 20:  # Process only first 20 to avoid overwhelming
+                    self._process_video_container(container)
+                    
         except Exception as e:
             print(f"Error extracting videos from current view: {e}")
     
@@ -222,7 +344,11 @@ class TikTokArabicExtractor:
                 try:
                     link = container.find_element(By.CSS_SELECTOR, selector)
                     if link.get_attribute('href'):
-                        return link.get_attribute('href')
+                        href = link.get_attribute('href')
+                        # Clean up the URL
+                        if '/video/' in href:
+                            return href.split('?')[0]  # Remove query parameters
+                        return href
                 except:
                     continue
             
@@ -234,7 +360,8 @@ class TikTokArabicExtractor:
                     try:
                         link = parent.find_element(By.CSS_SELECTOR, 'a[href*="/video/"]')
                         if link.get_attribute('href'):
-                            return link.get_attribute('href')
+                            href = link.get_attribute('href')
+                            return href.split('?')[0]
                     except:
                         pass
                     try:
@@ -257,28 +384,40 @@ class TikTokArabicExtractor:
             caption_selectors = [
                 '[data-e2e="browse-video-desc"]',
                 '[data-e2e="video-desc"]',
+                '[data-e2e="feed-video-desc"]',
                 'div[class*="DivVideoDesc"]',
                 'div[class*="DivVideoCaption"]',
+                'div[class*="DivCaption"]',
                 'span[class*="SpanText"]',
-                'p[class*="PText"]'
+                'p[class*="PText"]',
+                'div[class*="text"]',
+                'div[class*="caption"]'
             ]
             
             for selector in caption_selectors:
                 try:
                     caption_element = container.find_element(By.CSS_SELECTOR, selector)
                     if caption_element.text:
-                        return caption_element.text.strip()
+                        text = caption_element.text.strip()
+                        if len(text) > 5:  # Ensure it's substantial text
+                            return text
                 except:
                     continue
             
             # Fallback: look for any text content that might be a caption
             try:
-                text_elements = container.find_elements(By.CSS_SELECTOR, "span, p, div")
+                text_elements = container.find_elements(By.CSS_SELECTOR, "span, p, div, a")
                 for element in text_elements:
-                    if element.text and 10 < len(element.text) < 500:
+                    if element.text and 10 < len(element.text) < 1000:
                         text = element.text.strip()
                         # Check if it looks like a caption (not just UI text)
-                        if ' ' in text and '@' not in text and '#' not in text:
+                        if (' ' in text and 
+                            '@' not in text and 
+                            '#' not in text and
+                            'Follow' not in text and
+                            'Like' not in text and
+                            'Comment' not in text and
+                            'Share' not in text):
                             return text
             except:
                 pass
@@ -298,30 +437,40 @@ class TikTokArabicExtractor:
             username_selectors = [
                 '[data-e2e="browse-username"]',
                 '[data-e2e="video-author-uniqueId"]',
-                'a[href*="/@"]'
+                '[data-e2e="feed-username"]',
+                'a[href*="/@"]',
+                'span[class*="username"]',
+                'div[class*="username"]'
             ]
             
             for selector in username_selectors:
                 try:
                     username_element = container.find_element(By.CSS_SELECTOR, selector)
                     if username_element.text:
-                        metadata['username'] = username_element.text.strip()
-                        break
+                        username = username_element.text.strip()
+                        if username and len(username) > 0 and '@' not in username:
+                            metadata['username'] = username.replace('@', '')
+                            break
                 except:
                     continue
             
             # Try to extract like count
             like_selectors = [
                 '[data-e2e="like-count"]',
-                '[data-e2e="browse-like-count"]'
+                '[data-e2e="browse-like-count"]',
+                '[data-e2e="feed-like-count"]',
+                'span[class*="like"]',
+                'div[class*="like"]'
             ]
             
             for selector in like_selectors:
                 try:
                     like_element = container.find_element(By.CSS_SELECTOR, selector)
                     if like_element.text:
-                        metadata['likes'] = like_element.text.strip()
-                        break
+                        likes = like_element.text.strip()
+                        if likes and len(likes) > 0:
+                            metadata['likes'] = likes
+                            break
                 except:
                     continue
                     
@@ -329,13 +478,6 @@ class TikTokArabicExtractor:
             print(f"Error extracting metadata: {e}")
         
         return metadata
-    
-    def _scroll_down(self) -> None:
-        """Scroll down the page to load more content."""
-        try:
-            self.driver.execute_script("window.scrollBy(0, 1000);")
-        except Exception as e:
-            print(f"Error scrolling down: {e}")
     
     def stop_extraction(self) -> None:
         """Stop the extraction process."""
@@ -355,7 +497,7 @@ class TikTokArabicExtractor:
         
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"tiktok_arabic_videos_{timestamp}.json"
+            filename = f"tiktok_arabic_videos_{timestamp}"
         
         # Save as JSON
         json_filename = filename if filename.endswith('.json') else f"{filename}.json"
@@ -415,8 +557,8 @@ def main():
     
     args = parser.parse_args()
     
-    print("TikTok Arabic Video Extractor - Python Version")
-    print("=" * 50)
+    print("TikTok Arabic Video Extractor - Python Version (Fixed)")
+    print("=" * 60)
     
     extractor = None
     try:
